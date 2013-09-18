@@ -1,0 +1,58 @@
+fmq_server(3)
+=============
+
+NAME
+----
+fmq_server - a filemq server
+
+SYNOPSIS
+--------
+----
+//  Create a new fmq_server
+fmq_server_t *
+    fmq_server_new (void);
+
+//  Destroy the fmq_server
+void
+    fmq_server_destroy (fmq_server_t **self_p);
+
+//  Load server configuration data
+void
+    fmq_server_configure (fmq_server_t *self, const char *config_file);
+
+//  Set one configuration path value
+void
+    fmq_server_setoption (fmq_server_t *self, const char *path, const char *value);
+
+//  
+int
+    fmq_server_bind (fmq_server_t *self, const char *endpoint);
+
+//  
+void
+    fmq_server_publish (fmq_server_t *self, const char *location, const char *alias);
+
+//  
+void
+    fmq_server_set_anonymous (fmq_server_t *self, long enabled);
+
+//  Self test of this class
+int
+    fmq_server_test (bool verbose);
+----
+
+DESCRIPTION
+-----------
+
+the fmq_server class implements a generic filemq server.
+
+
+EXAMPLE
+-------
+.From fmq_server_test method
+----
+----
+
+SEE ALSO
+--------
+linkfmq:filemq[1]

@@ -1,0 +1,34 @@
+zconfig(3)
+==========
+
+NAME
+----
+zconfig - work with config files written in rfc.zeromq.org/spec:4/ZPL.
+
+SYNOPSIS
+--------
+----
+----
+
+DESCRIPTION
+-----------
+
+Lets applications load, work with, and save configuration files.
+This implements rfc.zeromq.org/spec:4/ZPL, which is a simple structured
+text format for configuration files.
+
+
+EXAMPLE
+-------
+.From zconfig_test method
+----
+    zconfig_t *root = zconfig_new ("root", NULL);
+    zconfig_t *section, *item;
+    
+    section = zconfig_new ("headers", root);
+    item = zconfig_new ("email", section);
+----
+
+SEE ALSO
+--------
+linkczmq:czmq[7]

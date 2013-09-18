@@ -1,0 +1,235 @@
+<class name = "fmq_server" codec = "fmq_msg" title = "a FILEMQ server"
+  short = "The fmq_server class implements a generic FILEMQ server." >
+FileMQ protocol server
+<include filename = "license.xml" />
+<include filename = "fmq_server_fsm.xml" />
+
+<declare type = "forward">
+//  There's no point making these configurable
+#define CHUNK_SIZE      1000000
+</declare>
+
+<!-- Server and client contexts -->
+<!-- self is the server, client is each incoming connection -->
+<self>
+<context>
+zlist_t *mounts;            //  Mount points
+int port;                   //  Server port
+</context>
+<construct>
+self->mounts = zlist_new ();
+</construct>
+<destruct>
+//  Destroy mount points
+while (zlist_size (self->mounts)) {
+    mount_t *mount = (mount_t *) zlist_pop (self->mounts);
+    mount_destroy (&mount);
+}
+zlist_destroy (&self->mounts);
+</destruct>
+</self>
+
+<client>
+<context>
+size_t credit;              //  Credit remaining
+zlist_t *patches;           //  Patches to send
+fmq_patch_t *patch;         //  Current patch
+fmq_file_t *file;           //  Current file we're sending
+off_t offset;               //  Offset of next read in file
+int64_t sequence;           //  Sequence number for chunk
+</context>
+<construct>
+self->patches = zlist_new ();
+</construct>
+<destruct>
+while (zlist_size (self->patches)) {
+    fmq_patch_t *patch = (fmq_patch_t *) zlist_pop (self->patches);
+    fmq_patch_destroy (&patch);
+}
+zlist_destroy (&self->patches);
+</destruct>
+</client>
+
+<!-- Embedded class for subscriptions -->
+<include filename = "fmq_server_sub.xml" />
+<!-- Embedded class for mount points -->
+<include filename = "fmq_server_mount.xml" />
+
+<!-- Action bodies -->
+<action name = "terminate the client">
+mount_t *mount = (mount_t *) zlist_first (self->mounts);
+while (mount) {
+    mount_sub_purge (mount, client);
+    mount = (mount_t *) zlist_next (self->mounts);
+}
+client->next_event = terminate_event;
+</action>
+
+<action name = "try anonymous access">
+if (atoi (zconfig_resolve (self->config, "security/anonymous", "0")) == 1)
+    client->next_event = friend_event;
+else
+if (atoi (zconfig_resolve (self->config, "security/plain", "0")) == 1)
+    client->next_event = maybe_event;
+else
+    client->next_event = foe_event;
+</action>
+    
+<action name = "list security mechanisms">
+if (atoi (zconfig_resolve (self->config, "security/anonymous", "0")) == 1)
+    fmq_msg_mechanisms_append (client->reply, "ANONYMOUS");
+if (atoi (zconfig_resolve (self->config, "security/plain", "0")) == 1)
+    fmq_msg_mechanisms_append (client->reply, "PLAIN");
+</action>
+
+<action name = "try security mechanism">
+client->next_event = foe_event;
+char *login, *password;
+if (streq (fmq_msg_mechanism (client->request), "PLAIN")
+&&  fmq_sasl_plain_decode (fmq_msg_response (client->request), &login, &password) == 0) {
+    zconfig_t *account = zconfig_locate (self->config, "security/plain/account");
+    while (account) {
+        if (streq (zconfig_resolve (account, "login", ""), login)
+        &&  streq (zconfig_resolve (account, "password", ""), password)) {
+            client->next_event = friend_event;
+            break;
+        }
+        account = zconfig_next (account);
+    }
+}
+free (login);
+free (password);
+</action>
+
+<action name = "store client subscription">
+//  Find mount point with longest match to subscription
+char *path = fmq_msg_path (client->request);
+
+mount_t *check = (mount_t *) zlist_first (self->mounts);
+mount_t *mount = check;
+while (check) {
+    //  If check->alias is prefix of path and alias is
+    //  longer than current mount then we have a new mount
+    if (strncmp (path, check->alias, strlen (check->alias)) == 0
+    &&  strlen (check->alias) > strlen (mount->alias))
+        mount = check;
+    check = (mount_t *) zlist_next (self->mounts);
+}
+mount_sub_store (mount, client, client->request);
+</action>
+
+<action name = "store client credit">
+client->credit += fmq_msg_credit (client->request);
+</action>
+
+<!-- Hook actions -->
+<declare>
+//  Client hash function that checks if client is alive
+static int
+client_dispatch (const char *key, void *client, void *server)
+{
+    server_client_execute ((server_t *) server, (client_t *) client, dispatch_event);
+    return 0;
+}
+</declare>
+
+<action name = "monitor the server">
+bool activity = false;
+mount_t *mount = (mount_t *) zlist_first (self->mounts);
+while (mount) {
+    if (mount_refresh (mount, self))
+        activity = true;
+    mount = (mount_t *) zlist_next (self->mounts);
+}
+if (activity)
+    zhash_foreach (self->clients, client_dispatch, self);
+</action>
+
+<action name = "get next patch for client">
+//  Get next patch for client if we're not doing one already
+if (client->patch == NULL)
+    client->patch = (fmq_patch_t *) zlist_pop (client->patches);
+if (client->patch == NULL) {
+    client->next_event = finished_event;
+    return;
+}
+//  Get virtual filename from patch
+fmq_msg_set_filename (client->reply, fmq_patch_virtual (client->patch));
+
+//  We can process a delete patch right away
+if (fmq_patch_op (client->patch) == patch_delete) {
+    fmq_msg_set_sequence (client->reply, client->sequence++);
+    fmq_msg_set_operation (client->reply, FMQ_MSG_FILE_DELETE);
+    client->next_event = send_delete_event;
+    
+    //  No reliability in this version, assume patch delivered safely
+    fmq_patch_destroy (&client->patch);
+}
+else
+if (fmq_patch_op (client->patch) == patch_create) {
+    //  Create patch refers to file, open that for input if needed
+    if (client->file == NULL) {
+        client->file = fmq_file_dup (fmq_patch_file (client->patch));
+        if (fmq_file_input (client->file)) {
+            //  File no longer available, skip it
+            fmq_patch_destroy (&client->patch);
+            fmq_file_destroy (&client->file);
+            client->next_event = next_patch_event;
+            return;
+        }
+        client->offset = 0;
+    }
+    //  Get next chunk for file
+    fmq_chunk_t *chunk = fmq_file_read (client->file, CHUNK_SIZE, client->offset);
+    assert (chunk);
+
+    //  Check if we have the credit to send chunk
+    if (fmq_chunk_size (chunk) <= client->credit) {
+        fmq_msg_set_sequence (client->reply, client->sequence++);
+        fmq_msg_set_operation (client->reply, FMQ_MSG_FILE_CREATE);
+        fmq_msg_set_offset (client->reply, client->offset);
+        fmq_msg_set_chunk (client->reply, zframe_new (
+            fmq_chunk_data (chunk),
+            fmq_chunk_size (chunk)));
+        
+        client->offset += fmq_chunk_size (chunk);
+        client->credit -= fmq_chunk_size (chunk);
+        client->next_event = send_chunk_event;
+        
+        //  Zero-sized chunk means end of file
+        if (fmq_chunk_size (chunk) == 0) {
+            fmq_file_destroy (&client->file);
+            fmq_patch_destroy (&client->patch);
+        }
+    }
+    else
+        client->next_event = no_credit_event;
+        
+    fmq_chunk_destroy (&chunk);
+}
+</action>
+
+<!-- API methods -->
+
+<method name = "bind" return = "number">
+<argument name = "endpoint" type = "string" />
+self->port = zsocket_bind (self->router, endpoint);
+<return>zstr_sendf (self->pipe, "%d", self->port);</return>
+</method>
+
+<method name = "publish">
+<argument name = "location" type = "string" />
+<argument name = "alias" type = "string" />
+mount_t *mount = mount_new (location, alias);
+zlist_append (self->mounts, mount);
+</method>
+
+<method name = "set anonymous">
+<argument name = "enabled" type = "number" />
+//  Enable anonymous access without a config file
+zconfig_put (self->config, "security/anonymous", enabled? "1" :"0");
+</method>
+
+<include filename = "fmq_server_selftest.xml" />
+
+</class>
